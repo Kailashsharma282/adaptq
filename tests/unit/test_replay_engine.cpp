@@ -246,5 +246,6 @@ TEST_CASE("ReplayEngine: replay retains all tokens when capacity is dynamically 
     ReplayReport report = engine.replay(snap, ctx);
 
     REQUIRE(report.n_tokens_replayed == N_TOKENS);
-    REQUIRE(ctx.get_storage(0, 0)->size() == N_TOKENS * 2); /* K and V */
+    /* dim=64 at 4 bits stores 32 bytes per K/V vector. */
+    REQUIRE(ctx.get_storage(0, 0)->bytes_used() == static_cast<size_t>(N_TOKENS * 2 * 32));
 }
