@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 
 /* -------------------------------------------------------------------------
@@ -70,7 +72,11 @@ const char **strategy_names(int *out_count) {
 
 static int next_pow2_rt(int n) {
     int p = 1;
-    while (p < n) p <<= 1;
+    while (p < n) {
+        if (p > std::numeric_limits<int>::max() / 2)
+            throw std::invalid_argument("RuntimeContext::init: dimension is too large");
+        p <<= 1;
+    }
     return p;
 }
 
@@ -85,12 +91,24 @@ void RuntimeContext::init(const RuntimeContextConfig &cfg) {
 void RuntimeContext::init(const RuntimeContextConfig &cfg,
                           StrategyFactory             strategy_fn,
                           StorageFactory              storage_fn) {
+    if (cfg.n_layers <= 0 || cfg.n_heads <= 0 || cfg.dim <= 0 || cfg.bits < 2 || cfg.bits > 4 || cfg.capacity <= 0)
+        throw std::invalid_argument("RuntimeContext::init: invalid configuration (layers, heads, dim, bits, or capacity)");
+    if (cfg.memory_budget_mb < 0.f || cfg.quality_floor < 0.f || cfg.latency_hard_limit_us < 0.f)
+        throw std::invalid_argument("RuntimeContext::init: negative runtime budgets are invalid");
+    if (!strategy_fn || !storage_fn)
+        throw std::invalid_argument("RuntimeContext::init: strategy_fn and storage_fn must not be null");
+
+    const int64_t head_count = static_cast<int64_t>(cfg.n_layers) * cfg.n_heads;
+    if (head_count > std::numeric_limits<int>::max() ||
+        static_cast<int64_t>(cfg.capacity) > std::numeric_limits<int>::max() / 2)
+        throw std::invalid_argument("RuntimeContext::init: configuration sizes are too large");
+
     cfg_      = cfg;
     token_pos_ = 0;
     token_log_.clear();
     token_log_data_.clear();
 
-    int n = cfg.n_layers * cfg.n_heads;
+    int n = static_cast<int>(head_count);
     strategies_.clear();  strategies_.reserve(n);
     storages_.clear();    storages_.reserve(n);
     cache_sizes_.assign(n, 0);
@@ -102,9 +120,16 @@ void RuntimeContext::init(const RuntimeContextConfig &cfg,
      * For FP32:      dim * 4 bytes.
      * Use the larger bound to keep storage backend generic.  */
     int padded       = next_pow2_rt(cfg_.dim);
-    int slot_bytes_q = (padded * cfg.bits + 7) / 8;
-    int slot_bytes_f = cfg_.dim * (int)sizeof(float);
+    const int64_t packed_bits = static_cast<int64_t>(padded) * cfg.bits;
+    const int64_t float_bytes = static_cast<int64_t>(cfg.dim) * sizeof(float);
+    if (packed_bits > static_cast<int64_t>(std::numeric_limits<int>::max()) * 8 ||
+        float_bytes > std::numeric_limits<int>::max())
+        throw std::invalid_argument("RuntimeContext::init: slot size is too large");
+    int slot_bytes_q = static_cast<int>((packed_bits + 7) / 8);
+    int slot_bytes_f = static_cast<int>(float_bytes);
     int slot_bytes   = std::max(slot_bytes_q, slot_bytes_f);
+    if (slot_bytes <= 0 || padded <= 0)
+        throw std::invalid_argument("RuntimeContext::init: padded/slot sizes are invalid");
 
     HeadConfig hcfg;
     hcfg.dim      = cfg_.dim;
@@ -116,14 +141,18 @@ void RuntimeContext::init(const RuntimeContextConfig &cfg,
         for (int h = 0; h < cfg.n_heads; ++h) {
             hcfg.seed = (uint64_t)l * 65537ULL + (uint64_t)h;
 
-            auto *strat = strategy_fn();
+            std::unique_ptr<IKVStrategy> strat(strategy_fn());
+            if (!strat)
+                throw std::runtime_error("RuntimeContext::init: strategy factory returned null");
             strat->init(hcfg);
-            strategies_.emplace_back(strat);
+            strategies_.emplace_back(std::move(strat));
 
-            auto *stor = storage_fn();
+            std::unique_ptr<IStorageBackend> stor(storage_fn());
+            if (!stor)
+                throw std::runtime_error("RuntimeContext::init: storage factory returned null");
             /* Storage holds K and V slots — capacity × 2. */
             stor->init(cfg.capacity * 2, slot_bytes);
-            storages_.emplace_back(stor);
+            storages_.emplace_back(std::move(stor));
         }
     }
 
@@ -178,6 +207,8 @@ void RuntimeContext::reset() {
 
 ExecutionContext RuntimeContext::make_ctx(int layer, int head) const {
     int idx = head_idx(layer, head);
+    if (idx < 0 || idx >= (int)storages_.size())
+        throw std::out_of_range("RuntimeContext::make_ctx: invalid head index");
     float mem_used = (float)storages_[idx]->bytes_used() / (1024.f * 1024.f);
 
     ExecutionContext ctx{};
@@ -204,11 +235,13 @@ ExecutionContext RuntimeContext::make_ctx(int layer, int head) const {
  * ========================================================================= */
 
 IKVStrategy *RuntimeContext::get_strategy(int layer, int head) const {
-    return strategies_[head_idx(layer, head)].get();
+    int idx = head_idx(layer, head);
+    return strategies_[idx].get();
 }
 
 IStorageBackend *RuntimeContext::get_storage(int layer, int head) const {
-    return storages_[head_idx(layer, head)].get();
+    int idx = head_idx(layer, head);
+    return storages_[idx].get();
 }
 
 /* =========================================================================
@@ -219,8 +252,10 @@ void RuntimeContext::append(int          layer,
                             int          head,
                             const float *k_vec,
                             const float *v_vec) {
-    assert(layer >= 0 && layer < cfg_.n_layers);
-    assert(head  >= 0 && head  < cfg_.n_heads);
+    if (layer < 0 || layer >= cfg_.n_layers || head < 0 || head >= cfg_.n_heads)
+        throw std::out_of_range("RuntimeContext::append: (layer, head) out of range");
+    if (!k_vec || !v_vec)
+        throw std::invalid_argument("RuntimeContext::append: key/value buffers must not be null");
 
     int idx = head_idx(layer, head);
     ExecutionContext ctx = make_ctx(layer, head);
@@ -284,8 +319,10 @@ ComputeMetrics RuntimeContext::compute(int          layer,
                                        int          head,
                                        const float *q_vec,
                                        float       *out) {
-    assert(layer >= 0 && layer < cfg_.n_layers);
-    assert(head  >= 0 && head  < cfg_.n_heads);
+    if (layer < 0 || layer >= cfg_.n_layers || head < 0 || head >= cfg_.n_heads)
+        throw std::out_of_range("RuntimeContext::compute: (layer, head) out of range");
+    if (!q_vec || !out)
+        throw std::invalid_argument("RuntimeContext::compute: query/output buffers must not be null");
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
